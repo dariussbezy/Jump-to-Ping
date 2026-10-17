@@ -1,7 +1,6 @@
 const rainRuntime = globalThis.rain;
 if (!rainRuntime || !rainRuntime.api || !rainRuntime.api.storage) throw new Error("Discord plugin API unavailable");
 const rainStore = rainRuntime.api.storage.createPluginStore("jumptoping", {});
-const pluginStorage = rainStore.settings;
 const implementation = (() => {
   "use strict";
   const { metro } = rainRuntime;
@@ -35,7 +34,8 @@ const implementation = (() => {
   let partsCache = null;
   let iconButtonCache = null;
 
-  const cfg = () => pluginStorage;
+  const cfg = () => rainStore.useStore.getState();
+  const setSetting = (key, value) => rainStore.useStore.getState().updateSettings({ [key]: value });
   const toast = (t) => { try { ui.toasts.showToast(t); } catch (_) {} };
   const clip = (s, n) => String(s == null ? "" : s).slice(0, n);
 
@@ -539,7 +539,7 @@ const implementation = (() => {
     const s = cfg();
     const rows = getRows();
     const toggle = (key, title, subtitle, icon, last) => h(CustomRow, { key, title, subtitle, icon, last: !!last,
-      trailing: h(CustomSwitch, { value: !!s[key], onChange: (v) => { s[key] = v; bump((x) => x + 1); schedule(); } }) });
+      trailing: h(CustomSwitch, { value: !!s[key], onChange: (v) => { setSetting(key, v); bump((x) => x + 1); schedule(); } }) });
     const guide = h(KitGuide, { key: "guide", title: "Quick guide", steps: [
       ["Where the button is", "When you have unread pings, a button appears in your profile bar next to the notifications bell. Tap it to open the list. Long-press it to jump straight to the newest ping."],
       ["Reading the list", "Each row is a chat with unread pings: a mention, a reply to you or a DM. You see the chat, who wrote, a short preview and the time. The red number on the button counts every unread ping."],
@@ -564,7 +564,9 @@ const implementation = (() => {
     initialized = true;
     const s = cfg();
     const defaults = { hideWhenEmpty: true, showBadge: true, includeDMs: true };
-    for (const k of Object.keys(defaults)) if (s[k] === undefined) s[k] = defaults[k];
+    const missing = {};
+    for (const k of Object.keys(defaults)) if (s[k] === undefined) missing[k] = defaults[k];
+    if (Object.keys(missing).length) rainStore.useStore.getState().updateSettings(missing);
     if (!loadStores()) { toast("Jump to Ping: required Discord modules not found"); return; }
     captured.clear();
     try { unpatches.push(patcher.before("dispatch", FluxDispatcher, hookDispatch)); } catch (_) {}
