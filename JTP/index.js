@@ -29,6 +29,9 @@ const implementation = (() => {
   let GuildStore;
   let ThemeStore;
   let notifyTimer = null;
+  let hydrationUnsubscribe = null;
+  let loadRequested = false;
+  let initialized = false;
   let partsCache = null;
   let iconButtonCache = null;
 
@@ -556,7 +559,9 @@ const implementation = (() => {
       h(RN.Text, { style: { color: C.sub, fontSize: 12, textAlign: "center", marginTop: 1, opacity: 0.7 } }, "Jump to Ping " + BUILD));
   }
 
-  function onLoad() {
+  function initializeAfterHydration() {
+    if (!loadRequested || initialized) return;
+    initialized = true;
     const s = cfg();
     const defaults = { hideWhenEmpty: true, showBadge: true, includeDMs: true };
     for (const k of Object.keys(defaults)) if (s[k] === undefined) s[k] = defaults[k];
@@ -568,7 +573,31 @@ const implementation = (() => {
     schedule();
   }
 
+  function onLoad() {
+    loadRequested = true;
+    const store = rainStore.useStore;
+    const current = store.getState();
+    if (current._hasHydrated) {
+      initializeAfterHydration();
+      return;
+    }
+
+    const checkHydration = (state) => {
+      if (!loadRequested || !state._hasHydrated) return;
+      if (hydrationUnsubscribe) hydrationUnsubscribe();
+      hydrationUnsubscribe = null;
+      initializeAfterHydration();
+    };
+    hydrationUnsubscribe = store.subscribe(checkHydration);
+    // Recheck after subscribing so hydration cannot finish between the first
+    // check and subscription registration.
+    checkHydration(store.getState());
+  }
+
   function onUnload() {
+    loadRequested = false;
+    if (hydrationUnsubscribe) { hydrationUnsubscribe(); hydrationUnsubscribe = null; }
+    initialized = false;
     for (const u of unpatches.splice(0)) { try { u(); } catch (_) {} }
     if (notifyTimer) { clearTimeout(notifyTimer); notifyTimer = null; }
     closeSheet();
