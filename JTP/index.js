@@ -9,7 +9,7 @@ const implementation = (() => {
   const { findByProps, findByStoreName } = metro;
   const { FluxDispatcher, React, ReactNative: RN } = metro.common;
 
-  const BUILD = "v1.0.0";
+  const BUILD = "v1.0.1";
   const SHEET_KEY = "jump-to-ping";
   const MAX_ROWS = 50;
   const MAX_CHANNELS = 300;
@@ -31,6 +31,9 @@ const implementation = (() => {
   let hydrationUnsubscribe = null;
   let loadRequested = false;
   let initialized = false;
+  let barMode = "none";
+  let barHits = 0;
+  const nudgeTimers = [];
   let partsCache = null;
   let iconButtonCache = null;
 
@@ -519,16 +522,56 @@ const implementation = (() => {
     for (const t of tries) { try { const r = t(); if (r && r.type) return r; } catch (_) {} }
     return null;
   }
+  function BellWithPing(p) {
+    const h = React.createElement;
+    return h(React.Fragment, null, p.original, h(PingButton, { hasNameplate: !!p.hasNameplate }));
+  }
+  function isBell(C, Btn) {
+    if (!C) return false;
+    if (Btn && C === Btn) return true;
+    if (typeof C !== "function" && typeof C !== "object") return false;
+    const inner = C.type || C;
+    const name = inner && (inner.displayName || inner.name);
+    return name === "YouBarNotificationsButton";
+  }
   function patchYouBar() {
     const Btn = findYouBarButton();
+    let runtime = null;
+    try { const r = findByProps("jsx", "jsxs"); if (r && typeof r.jsx === "function") runtime = r; } catch (_) {}
+    if (runtime) {
+      // Wrap the bell at element-creation time. This works even when the profile bar
+      // is already mounted (a plain patch on the component type would be ignored then).
+      const wrap = (args, ret) => {
+        try {
+          const C = args && args[0];
+          if (!ret || ret.type === BellWithPing || !isBell(C, Btn)) return;
+          barHits++;
+          const props = ret.props || args[1] || {};
+          const next = { original: ret, hasNameplate: !!props.hasNameplate };
+          if (ret.key != null) next.key = ret.key;
+          return React.createElement(BellWithPing, next);
+        } catch (_) {}
+      };
+      unpatches.push(patcher.after("jsx", runtime, wrap));
+      if (typeof runtime.jsxs === "function") unpatches.push(patcher.after("jsxs", runtime, wrap));
+      barMode = "jsx";
+      return true;
+    }
     if (!Btn) return false;
     unpatches.push(patcher.after("type", Btn, (args, res) => {
       try {
         const props = args && args[0] || {};
+        barHits++;
         return React.createElement(React.Fragment, null, res, React.createElement(PingButton, { hasNameplate: !!props.hasNameplate }));
       } catch (_) { return res; }
     }));
+    barMode = "type";
     return true;
+  }
+  function nudge() {
+    const poke = () => { try { UserStore && UserStore.emitChange && UserStore.emitChange(); } catch (_) {} };
+    poke();
+    for (const ms of [600, 1800, 4000]) nudgeTimers.push(setTimeout(poke, ms));
   }
 
   /* ---- settings ---- */
@@ -553,6 +596,9 @@ const implementation = (() => {
         toggle("showBadge", "Show count badge", "Show the number of unread pings on the button.", "at", true)),
       h(CustomSection, { key: "list", title: "List" },
         toggle("includeDMs", "Include DMs", "List unread direct messages as pings.", "chat", true)),
+      h(CustomSection, { key: "status", title: "Status" },
+        h(CustomRow, { title: "Profile bar", icon: "bell", last: true,
+          subtitle: barMode === "none" ? "Not connected. Restart Discord, then check again." : barHits ? "Connected (" + barHits + (barHits === 1 ? " render" : " renders") + ")" : "Waiting for the profile bar to show. Open the Home tab." })),
       h(CustomSection, { key: "preview", title: "Preview" },
         h(CustomAction, { title: "Open ping list", secondary: true, onPress: openPings })),
       guide,
@@ -571,7 +617,7 @@ const implementation = (() => {
     captured.clear();
     try { unpatches.push(patcher.before("dispatch", FluxDispatcher, hookDispatch)); } catch (_) {}
     if (!patchYouBar()) toast("Jump to Ping: could not find the profile bar");
-    try { UserStore.emitChange && UserStore.emitChange(); } catch (_) {}
+    nudge();
     schedule();
   }
 
@@ -600,6 +646,9 @@ const implementation = (() => {
     loadRequested = false;
     if (hydrationUnsubscribe) { hydrationUnsubscribe(); hydrationUnsubscribe = null; }
     initialized = false;
+    barMode = "none";
+    barHits = 0;
+    for (const t of nudgeTimers.splice(0)) clearTimeout(t);
     for (const u of unpatches.splice(0)) { try { u(); } catch (_) {} }
     if (notifyTimer) { clearTimeout(notifyTimer); notifyTimer = null; }
     closeSheet();
