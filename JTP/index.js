@@ -9,12 +9,12 @@ const implementation = (() => {
   const { findByProps, findByStoreName } = metro;
   const { FluxDispatcher, React, ReactNative: RN } = metro.common;
 
-  const BUILD = "v1.0.1";
+  const BUILD = "v1.0.2";
   const SHEET_KEY = "jump-to-ping";
   const MAX_ROWS = 50;
   const MAX_CHANNELS = 300;
   const PER_CHANNEL = 25;
-  const SNIPPET = 140;
+  const SNIPPET = 160;
   const RED = "#ED4245";
   const ICON_CANDIDATES = ["AtIcon", "MentionIcon", "ChatMarkUnreadIcon", "BellIcon"];
 
@@ -28,11 +28,16 @@ const implementation = (() => {
   let GuildStore;
   let ThemeStore;
   let notifyTimer = null;
+  let SelectedChannelStore;
+  let activeFetches = 0;
+  const resolved = new Map();
+  const inflight = new Set();
+  const failedAt = new Map();
+  const pending = [];
+  const jumpTimers = [];
   let hydrationUnsubscribe = null;
   let loadRequested = false;
   let initialized = false;
-  let barMode = "none";
-  let barHits = 0;
   const nudgeTimers = [];
   let partsCache = null;
   let iconButtonCache = null;
@@ -240,6 +245,7 @@ const implementation = (() => {
     UserStore = UserStore || findByStoreName("UserStore");
     ChannelStore = ChannelStore || findByStoreName("ChannelStore");
     GuildStore = GuildStore || findByStoreName("GuildStore");
+    SelectedChannelStore = SelectedChannelStore || findByStoreName("SelectedChannelStore");
     return !!(ReadStateStore && UserStore && ChannelStore && FluxDispatcher);
   }
   const getChannel = (id) => { try { return id ? ChannelStore.getChannel(id) : null; } catch (_) { return null; } };
@@ -364,6 +370,68 @@ const implementation = (() => {
     return loadedMention(channelId, oldest);
   }
 
+  /* ---- resolve the real ping message (preview + exact jump target) ---- */
+  function decId(id) {
+    const a = String(id).split("");
+    let i = a.length - 1;
+    while (i >= 0) {
+      if (a[i] === "0") { a[i] = "9"; i--; } else { a[i] = String(Number(a[i]) - 1); break; }
+    }
+    return a.join("").replace(/^0+(?=\d)/, "");
+  }
+  function restApi() {
+    try { const m = findByProps("getAPIBaseURL", "del"); return m && typeof m.get === "function" ? m : null; } catch (_) { return null; }
+  }
+  async function fetchPing(channelId, oldest) {
+    const api = restApi();
+    if (!api) throw new Error("no api");
+    const ch = getChannel(channelId), me = myId();
+    let after = decId(oldest);
+    for (let page = 0; page < 3; page++) {
+      const res = await api.get({ url: "/channels/" + channelId + "/messages", query: { limit: 50, after } });
+      const list = ((res && (res.body || res.data)) || []).filter((m) => m && m.id).slice().sort((x, y) => (x.id === y.id ? 0 : gte(x.id, y.id) ? 1 : -1));
+      for (const m of list) { const kind = pingKind(m, ch, me); if (kind) return entryFrom(m, kind); }
+      if (list.length < 50) break;
+      after = list[list.length - 1].id;
+    }
+    return null;
+  }
+  function remember(channelId, oldest, entry) {
+    resolved.delete(String(channelId));
+    resolved.set(String(channelId), { oldest: String(oldest), entry });
+    while (resolved.size > MAX_CHANNELS) resolved.delete(resolved.keys().next().value);
+  }
+  function pump() {
+    while (activeFetches < 3 && pending.length) {
+      const r = pending.shift();
+      activeFetches++;
+      fetchPing(r.c, r.oldest).then(
+        (entry) => { remember(r.c, r.oldest, entry); failedAt.delete(r.c); },
+        () => { failedAt.set(r.c, Date.now()); }
+      ).then(() => { inflight.delete(r.c); activeFetches--; schedule(); pump(); });
+    }
+  }
+  function resolveRows(rows) {
+    for (const r of rows.filter((x) => x.needs).slice(0, 15)) {
+      if (inflight.has(r.c)) continue;
+      const failed = failedAt.get(r.c);
+      if (failed && Date.now() - failed < 30000) continue;
+      inflight.add(r.c);
+      pending.push(r);
+    }
+    pump();
+  }
+  function ensureResolved(r) {
+    const cached = resolved.get(r.c);
+    if (cached && cached.oldest === String(r.oldest)) return Promise.resolve(cached.entry);
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (e) => { if (!done) { done = true; resolve(e); } };
+      setTimeout(() => finish(null), 3500);
+      fetchPing(r.c, r.oldest).then((entry) => { remember(r.c, r.oldest, entry); schedule(); finish(entry); }, () => finish(null));
+    });
+  }
+
   function getRows() {
     if (!ReadStateStore) return [];
     let ids = [];
@@ -378,9 +446,15 @@ const implementation = (() => {
       if (dm && !cfg().includeDMs) continue;
       let oldest = null;
       try { oldest = ReadStateStore.getOldestUnreadMessageId ? ReadStateStore.getOldestUnreadMessageId(channelId) : null; } catch (_) {}
-      const hit = pickMessage(channelId, oldest);
+      let hit = pickMessage(channelId, oldest);
+      let needs = false;
+      if (!hit && oldest) {
+        const cached = resolved.get(String(channelId));
+        if (cached && cached.oldest === String(oldest)) hit = cached.entry;
+        else needs = true;
+      }
       const id = hit ? hit.id : oldest || null;
-      rows.push({ c: String(channelId), g: ch && ch.guild_id || null, count, id, an: hit && hit.an || "", t: hit && hit.t || "", k: hit && hit.k || (dm ? "dm" : "mention"), dm, at: hit && hit.at || (id ? snowflakeTime(id) : 0) });
+      rows.push({ c: String(channelId), g: ch && ch.guild_id || null, count, id, oldest, needs, an: hit && hit.an || "", t: hit && hit.t || "", k: hit && hit.k || (dm ? "dm" : "mention"), dm, at: hit && hit.at || (id ? snowflakeTime(id) : 0) });
     }
     rows.sort((a, b) => (b.at || 0) - (a.at || 0));
     return rows.slice(0, MAX_ROWS);
@@ -411,13 +485,28 @@ const implementation = (() => {
         navigate.transitionToChannel(String(channelId), {});
       } catch (_) { toast("Could not open this chat"); return; }
       if (!messageId) return;
+      const cid = String(channelId), mid = String(messageId);
       setTimeout(() => {
+        let loaded = false;
+        try { loaded = !!(MessageStore && MessageStore.getMessage && MessageStore.getMessage(cid, mid)); } catch (_) {}
         try {
           if (!jump || typeof jump.jumpToMessage !== "function") throw Error();
-          jump.jumpToMessage({ channelId: String(channelId), messageId: String(messageId), flash: true, jumpType: "ANIMATED" });
-        } catch (_) { toast("Could not jump to this message"); }
+          jump.jumpToMessage({ channelId: cid, messageId: mid, flash: true, jumpType: loaded ? "ANIMATED" : "INSTANT" });
+        } catch (_) { toast("Could not jump to this message"); return; }
+        // Second pass: once the messages around the target have loaded, the list can sit a bit off. Re-center once.
+        jumpTimers.push(setTimeout(() => {
+          try {
+            if (SelectedChannelStore && SelectedChannelStore.getChannelId && String(SelectedChannelStore.getChannelId()) !== cid) return;
+            jump.jumpToMessage({ channelId: cid, messageId: mid, flash: true, jumpType: "INSTANT" });
+          } catch (_) {}
+        }, 1500));
       }, 650);
     }, 220);
+  }
+  function jumpToPing(r) {
+    if (!r) return;
+    if (!r.needs) { jumpTo(r.c, r.id); return; }
+    ensureResolved(r).then((e) => jumpTo(r.c, e ? e.id : r.id));
   }
 
   function rowSubtitle(r) {
@@ -434,6 +523,7 @@ const implementation = (() => {
     const rows = getRows();
     const total = totalOf(rows);
     const parts = sheetParts();
+    React.useEffect(() => { resolveRows(rows); }, [rows.map((r) => r.c + ":" + (r.needs ? 1 : 0)).join("|")]);
     const subtitle = rows.length
       ? total + (total === 1 ? " unread ping" : " unread pings") + " in " + rows.length + (rows.length === 1 ? " chat" : " chats")
       : "You are all caught up";
@@ -442,8 +532,8 @@ const implementation = (() => {
         h(RN.View, { style: { backgroundColor: C.card2, borderRadius: 20, overflow: "hidden", borderWidth: 1, borderColor: C.divider } },
           ...rows.map((r, i) => h(CustomRow, {
             key: r.c, icon: r.dm ? "chat" : r.k === "reply" ? "reply" : "at", title: channelLabel(r.c, r.g), subtitle: rowSubtitle(r),
-            last: i === rows.length - 1, onPress: () => jumpTo(r.c, r.id),
-            trailing: KitChip({ label: "Jump to", active: true, flush: true, onPress: () => jumpTo(r.c, r.id) }),
+            last: i === rows.length - 1, onPress: () => jumpToPing(r),
+            trailing: KitChip({ label: "Jump to", active: true, flush: true, onPress: () => jumpToPing(r) }),
           }))))
       : h(RN.Text, { style: { color: C.sub, fontSize: 14, lineHeight: 20, textAlign: "center", paddingVertical: 28 } }, "No unread pings right now.");
     const body = h(RN.View, { style: { paddingHorizontal: 16, paddingBottom: 24 } },
@@ -463,7 +553,7 @@ const implementation = (() => {
     try {
       const sheets = findByProps("showSimpleActionSheet");
       if (sheets && typeof sheets.showSimpleActionSheet === "function") {
-        sheets.showSimpleActionSheet({ key: SHEET_KEY, header: { title: "Pings" }, options: rows.slice(0, 20).map((r) => ({ label: channelLabel(r.c, r.g) + " (" + r.count + ")", onPress: () => jumpTo(r.c, r.id) })) });
+        sheets.showSimpleActionSheet({ key: SHEET_KEY, header: { title: "Pings" }, options: rows.slice(0, 20).map((r) => ({ label: channelLabel(r.c, r.g) + " (" + r.count + ")", onPress: () => jumpToPing(r) })) });
         return;
       }
     } catch (_) {}
@@ -482,7 +572,7 @@ const implementation = (() => {
   function jumpToNewest() {
     const rows = getRows();
     if (!rows.length) { toast("No unread pings"); return; }
-    jumpTo(rows[0].c, rows[0].id);
+    jumpToPing(rows[0]);
   }
 
   /* ---- profile bar button ---- */
@@ -524,7 +614,7 @@ const implementation = (() => {
   }
   function BellWithPing(p) {
     const h = React.createElement;
-    return h(React.Fragment, null, p.original, h(PingButton, { hasNameplate: !!p.hasNameplate }));
+    return h(React.Fragment, null, h(PingButton, { hasNameplate: !!p.hasNameplate }), p.original);
   }
   function isBell(C, Btn) {
     if (!C) return false;
@@ -545,7 +635,6 @@ const implementation = (() => {
         try {
           const C = args && args[0];
           if (!ret || ret.type === BellWithPing || !isBell(C, Btn)) return;
-          barHits++;
           const props = ret.props || args[1] || {};
           const next = { original: ret, hasNameplate: !!props.hasNameplate };
           if (ret.key != null) next.key = ret.key;
@@ -554,18 +643,15 @@ const implementation = (() => {
       };
       unpatches.push(patcher.after("jsx", runtime, wrap));
       if (typeof runtime.jsxs === "function") unpatches.push(patcher.after("jsxs", runtime, wrap));
-      barMode = "jsx";
       return true;
     }
     if (!Btn) return false;
     unpatches.push(patcher.after("type", Btn, (args, res) => {
       try {
         const props = args && args[0] || {};
-        barHits++;
-        return React.createElement(React.Fragment, null, res, React.createElement(PingButton, { hasNameplate: !!props.hasNameplate }));
+        return React.createElement(React.Fragment, null, React.createElement(PingButton, { hasNameplate: !!props.hasNameplate }), res);
       } catch (_) { return res; }
     }));
-    barMode = "type";
     return true;
   }
   function nudge() {
@@ -596,9 +682,6 @@ const implementation = (() => {
         toggle("showBadge", "Show count badge", "Show the number of unread pings on the button.", "at", true)),
       h(CustomSection, { key: "list", title: "List" },
         toggle("includeDMs", "Include DMs", "List unread direct messages as pings.", "chat", true)),
-      h(CustomSection, { key: "status", title: "Status" },
-        h(CustomRow, { title: "Profile bar", icon: "bell", last: true,
-          subtitle: barMode === "none" ? "Not connected. Restart Discord, then check again." : barHits ? "Connected (" + barHits + (barHits === 1 ? " render" : " renders") + ")" : "Waiting for the profile bar to show. Open the Home tab." })),
       h(CustomSection, { key: "preview", title: "Preview" },
         h(CustomAction, { title: "Open ping list", secondary: true, onPress: openPings })),
       guide,
@@ -609,7 +692,7 @@ const implementation = (() => {
     if (!loadRequested || initialized) return;
     initialized = true;
     const s = cfg();
-    const defaults = { hideWhenEmpty: true, showBadge: true, includeDMs: true };
+    const defaults = { hideWhenEmpty: true, showBadge: true, includeDMs: false };
     const missing = {};
     for (const k of Object.keys(defaults)) if (s[k] === undefined) missing[k] = defaults[k];
     if (Object.keys(missing).length) rainStore.useStore.getState().updateSettings(missing);
@@ -646,14 +729,14 @@ const implementation = (() => {
     loadRequested = false;
     if (hydrationUnsubscribe) { hydrationUnsubscribe(); hydrationUnsubscribe = null; }
     initialized = false;
-    barMode = "none";
-    barHits = 0;
     for (const t of nudgeTimers.splice(0)) clearTimeout(t);
     for (const u of unpatches.splice(0)) { try { u(); } catch (_) {} }
     if (notifyTimer) { clearTimeout(notifyTimer); notifyTimer = null; }
     closeSheet();
     listeners.clear();
     captured.clear();
+    resolved.clear(); inflight.clear(); failedAt.clear(); pending.length = 0; activeFetches = 0;
+    for (const t of jumpTimers.splice(0)) clearTimeout(t);
     try { UserStore && UserStore.emitChange && UserStore.emitChange(); } catch (_) {}
   }
 

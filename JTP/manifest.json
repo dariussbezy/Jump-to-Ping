@@ -2,7 +2,7 @@
   "id": "jumptoping",
   "name": "Jump to Ping",
   "description": "Adds a button next to the notifications bell that lists your unread pings with a Jump to button. Check the plugin settings!",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "authors": [
     "dariussbezy"
   ],
